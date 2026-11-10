@@ -4,15 +4,18 @@ const TYPE_ECHO_REPLY: u8 = 0;
 const TYPE_ECHO_REQUEST: u8 = 8;
 
 comptime {
-    asm (r4os.r4dev.protocolEntriesAsm("neticmp_init", "neticmp_shutdown", "neticmp_query", "neticmp_dispatch"));
+    if (!@import("builtin").is_test) asm (r4os.technical2.protocolEntriesAsm("neticmp_init", "neticmp_shutdown", "neticmp_query", "neticmp_dispatch"));
 }
 
-export fn neticmp_init(api: *const r4os.r4dev.ProtocolApi) callconv(.c) i32 {
-    var ctx = r4os.r4dev.ProtocolContext.init(api);
-    ctx.logInfo("NETICMP.R4P init");
-    _ = ctx.registerRole("net.icmp", .net, 0);
-    _ = ctx.setStatus(.active, "ICMP R4P active");
-    return 0;
+export fn neticmp_init(api: *const r4os.technical2.abi.ProtocolApi2) callconv(.c) i32 {
+    const view = r4os.technical2.Protocol.init(api) orelse return r4os.abi.network_error_backend;
+    const log = view.function("log_info") orelse return r4os.abi.err_no_fn;
+    const register = view.function("register_role") orelse return r4os.abi.err_no_fn;
+    const status = view.function("set_status") orelse return r4os.abi.err_no_fn;
+    log("NETICMP.R4P init");
+    const registered = register("net.icmp", @intFromEnum(r4os.abi.ProtocolCategory.net), 0);
+    if (registered != 0) return registered;
+    return status(@intFromEnum(r4os.abi.ProtocolState.active), "ICMP R4P active");
 }
 
 export fn neticmp_shutdown() callconv(.c) i32 {
@@ -107,29 +110,30 @@ fn buildEchoReply(request: *r4os.abi.IcmpOp) void {
 }
 
 fn requestFromBuffer(buffer: *const r4os.abi.ProtocolBuffer) ?*r4os.abi.IcmpOp {
-    if (buffer.data == null) return null;
-    if (buffer.len < @sizeOf(r4os.abi.IcmpOp)) return null;
-    return @ptrCast(@alignCast(buffer.data.?));
+    // The legacy operation is an exclusive in/out native record, despite
+    // the const transport metadata. No packet bytes are native-cast here.
+    const native = r4os.native_protocol_view;
+    var metadata = buffer.*;
+    const view = native.InOut(r4os.abi.IcmpOp).init(&metadata, native.Policy.record(r4os.abi.IcmpOp, .inout, .prefix)) catch return null;
+    return view.value;
 }
 
 fn checksum(data: []const u8) u16 {
-    var sum: u32 = 0;
-    var i: usize = 0;
-    while (i + 1 < data.len) : (i += 2) {
-        sum += (@as(u32, data[i]) << 8) | data[i + 1];
-    }
-    if (i < data.len) sum += @as(u32, data[i]) << 8;
-    while ((sum >> 16) != 0) sum = (sum & 0xFFFF) + (sum >> 16);
-    return @intCast(~sum & 0xFFFF);
+    var value: r4os.internet_checksum.Checksum16 = .{};
+    value.add(data) catch unreachable;
+    return value.finish() catch unreachable;
 }
 
 fn readBe16(buf: []const u8, offset: usize) u16 {
-    return (@as(u16, buf[offset]) << 8) | buf[offset + 1];
+    var reader = r4os.binary_cursor.Reader.init(buf) catch unreachable;
+    _ = reader.take(offset) catch unreachable;
+    return reader.readInt(u16, .big) catch unreachable;
 }
 
 fn writeBe16(buf: []u8, offset: usize, value: u16) void {
-    buf[offset] = @intCast(value >> 8);
-    buf[offset + 1] = @intCast(value & 0xFF);
+    var writer = r4os.binary_cursor.Writer.init(buf) catch unreachable;
+    writer.position = offset;
+    writer.writeInt(u16, value, .big) catch unreachable;
 }
 
 fn note(comptime text: []const u8) [64]u8 {
